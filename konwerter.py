@@ -188,8 +188,9 @@ def duration(path):
     return int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]) if m else 0
 
 
-def video_args(ext, quality, max_h):
-    """Parametry wyjsciowe ffmpeg dla danego formatu (max_h = 0: bez zmiany rozmiaru)."""
+def video_args(ext, quality, max_h, vkbps=0):
+    """Parametry wyjsciowe ffmpeg dla danego formatu (max_h = 0: bez zmiany rozmiaru;
+    vkbps > 0: MP4 ze stalym bitrate wideo zamiast CRF, audio AUDIO_KBPS)."""
     _, crf, q4, qa = QUALITY[quality]
     if ext == ".mp3":
         return ["-vn", "-c:a", "libmp3lame", "-q:a", str(qa)]
@@ -200,6 +201,9 @@ def video_args(ext, quality, max_h):
     # parzyste wymiary sa wymagane przez H.264/yuv420p
     base = ["-map", "0:v:0", "-map", "0:a:0?", "-vf", "scale=-2:'trunc(min(ih,%d)/2)*2'" % (max_h or 99999),
             "-pix_fmt", "yuv420p"]
+    if vkbps and ext == ".mp4":
+        return base + ["-c:v", "libx264", "-preset", "medium", "-b:v", "%dk" % vkbps, "-c:a", "aac",
+                       "-b:a", "%dk" % AUDIO_KBPS, "-movflags", "+faststart"]
     if ext in (".mp4", ".mkv"):
         return base + ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-c:a", "aac",
                        "-b:a", "160k"] + (["-movflags", "+faststart"] if ext == ".mp4" else [])
@@ -209,12 +213,15 @@ def video_args(ext, quality, max_h):
     return base + ["-c:v", "mpeg4", "-q:v", str(q4), "-c:a", "libmp3lame", "-q:a", "3"]  # .avi
 
 
-def convert_video(src, dst, ext, quality, max_h, progress=None, stop=None):
-    """Konwersja ffmpeg. progress(0..1) w trakcie; zwraca False, gdy przerwano (stop)."""
+AUDIO_KBPS = 128  # audio MP4 przy limicie rozmiaru
+MIN_VIDEO_KBPS = 50  # ponizej tego obraz byłby nie do ogladania
+
+
+def _ffmpeg(args, total, progress, stop):
+    """Jedno uruchomienie ffmpeg; zwraca False, gdy przerwano (stop), blad = RuntimeError."""
     global _proc
-    total = duration(src)
     cmd = [ffmpeg_exe(), "-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-nostats",
-           "-progress", "pipe:1", "-i", src] + video_args(ext, quality, max_h) + [dst]
+           "-progress", "pipe:1"] + args
     _proc = p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                  encoding="utf-8", errors="replace", creationflags=NOWIN)
     err = []
@@ -230,25 +237,69 @@ def convert_video(src, dst, ext, quality, max_h, progress=None, stop=None):
             err.append(line.strip())
     p.wait()
     _proc = None
-    if (stop is not None and stop.is_set()) or p.returncode:
-        if os.path.exists(dst):
-            os.remove(dst)
-        if p.returncode and not (stop is not None and stop.is_set()):
-            raise RuntimeError(" ".join(err[-3:]) or "ffmpeg zakonczyl sie bledem %d" % p.returncode)
+    if stop is not None and stop.is_set():
         return False
+    if p.returncode:
+        raise RuntimeError(" ".join(err[-3:]) or "ffmpeg zakonczyl sie bledem %d" % p.returncode)
     return True
+
+
+def convert_video(src, dst, ext, quality, max_h, progress=None, stop=None, max_mb=0, log=print):
+    """Konwersja ffmpeg. progress(0..1) w trakcie; zwraca False, gdy przerwano (stop).
+    max_mb > 0 (tylko MP4): kodowanie dwuprzebiegowe z bitrate wyliczonym z limitu rozmiaru."""
+    total = duration(src)
+    try:
+        if not (max_mb and ext == ".mp4"):
+            return _ffmpeg(["-i", src] + video_args(ext, quality, max_h) + [dst], total, progress, stop) or _drop(dst)
+        # kbit/s calosci = MB * 8192 / czas; po odjeciu audio zostaje budzet na wideo
+        if not total:
+            raise RuntimeError("nie mozna odczytac czasu trwania - limit rozmiaru niemozliwy")
+        kbps = int(max_mb * 8192 / total) - AUDIO_KBPS
+        if kbps < MIN_VIDEO_KBPS:
+            log("  Limit %s MB jest za maly dla filmu o dlugosci %.0f s - uzyto minimum %d kb/s wideo, "
+                "wynik moze byc wiekszy niz limit." % (max_mb, total, MIN_VIDEO_KBPS))
+            kbps = MIN_VIDEO_KBPS
+        args = video_args(ext, quality, max_h, kbps)
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        try:
+            plog = os.path.join(tmp, "pass")
+            p1 = [a for a in args if a not in ("-movflags", "+faststart")] + [
+                "-pass", "1", "-passlogfile", plog, "-an", "-f", "null", os.devnull]
+            half = (lambda f: progress(f / 2)) if progress else None
+            half2 = (lambda f: progress(0.5 + f / 2)) if progress else None
+            if not _ffmpeg(["-i", src] + p1, total, half, stop):
+                return False
+            return _ffmpeg(["-i", src] + args + ["-pass", "2", "-passlogfile", plog, dst],
+                           total, half2, stop) or _drop(dst)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    except RuntimeError:
+        _drop(dst)
+        raise
+
+
+def _drop(dst):
+    """Usuwa niedokonczony plik wynikowy; zwraca False (przerwano)."""
+    if os.path.exists(dst):
+        os.remove(dst)
+    return False
 
 
 # ----------------------------------------------------------------- uruchom ----
 
 
-def run(kind, fmt, inp, out_dir, quality="Dobra", size=0, log=print, progress=None, stop=None):
+def run(kind, fmt, inp, out_dir, quality="Dobra", size=0, log=print, progress=None, stop=None, max_mb=0):
     """kind: 'obraz' | 'wideo'; fmt: klucz IMAGE_OUT / VIDEO_OUT; size: maks. dluzszy bok / wysokosc
-    w px (0 = bez zmiany); progress(0..1) dla calosci; stop: threading.Event przerywajacy."""
+    w px (0 = bez zmiany); progress(0..1) dla calosci; stop: threading.Event przerywajacy;
+    max_mb: maks. rozmiar filmu w MB (tylko MP4, 0 = bez limitu)."""
     table = IMAGE_OUT if kind == "obraz" else VIDEO_OUT
     if fmt not in table or quality not in QUALITY:
         raise ValueError("nieznany format lub jakosc: %s / %s" % (fmt, quality))
     ext = table[fmt][0]
+    if max_mb and (kind != "wideo" or ext != ".mp4"):
+        log("Limit rozmiaru pliku dotyczy tylko wideo -> MP4 - pominieto.")
+        max_mb = 0
     todo = []
     for f in list_inputs(inp, IMG_IN if kind == "obraz" else VID_IN + (".gif",)):
         if matches(f, kind):
@@ -275,7 +326,8 @@ def run(kind, fmt, inp, out_dir, quality="Dobra", size=0, log=print, progress=No
                 if note:
                     log("  " + note)
             elif not convert_video(f, dst, ext, quality, size,
-                                   (lambda fr, i=i: progress((i + fr) / len(todo))) if progress else None, stop):
+                                   (lambda fr, i=i: progress((i + fr) / len(todo))) if progress else None, stop,
+                                   max_mb, log):
                 log("  Przerwano.")
                 break
             log("  OK -> %s (%s -> %s)" % (dst, fsize(f), fsize(dst)))
@@ -314,6 +366,7 @@ def gui():
     v_q = tk.StringVar(value=cfg.get("q") if cfg.get("q") in QUALITY else "Dobra")
     v_size = tk.StringVar(value=cfg.get("size_px", "Oryginal"))
     v_out = tk.StringVar(value=cfg.get("out") or out_default)
+    v_mb = tk.StringVar(value=str(cfg.get("max_mb", "")))
     items = []  # pliki na liscie
     stop = threading.Event()
 
@@ -335,6 +388,11 @@ def gui():
     lbl_size.grid(row=3, column=0, sticky="w", **pad)
     cb_size = ttk.Combobox(top, textvariable=v_size, state="readonly", width=12)
     cb_size.grid(row=3, column=1, sticky="w", **pad)
+    lbl_mb = ttk.Label(top, text="Maks. rozmiar pliku (MB):")
+    lbl_mb.grid(row=4, column=0, sticky="w", **pad)
+    ent_mb = ttk.Entry(top, textvariable=v_mb, width=8)
+    ent_mb.grid(row=4, column=1, sticky="w", **pad)
+    ttk.Label(top, text="tylko wideo -> MP4, puste = bez limitu").grid(row=4, column=1, sticky="w", padx=90)
 
     def on_kind(*_):
         table = IMAGE_OUT if v_kind.get() == "obraz" else VIDEO_OUT
@@ -457,6 +515,12 @@ def gui():
         kind, fmt = v_kind.get(), v_fmt.get().split(" - ")[0]
         size = 0 if v_size.get() == "Oryginal" else int(v_size.get())
         quality = v_q.get()  # zmienne Tk czytamy tu, w watku okna, nie w roboczym
+        try:
+            max_mb = float(v_mb.get().replace(",", ".") or 0)
+            if max_mb < 0:
+                raise ValueError
+        except ValueError:
+            return log("Maks. rozmiar pliku: wpisz liczbe MB (np. 25) albo zostaw puste.")
         stop.clear()
         busy(True)
         log_box.delete("1.0", "end")
@@ -465,7 +529,7 @@ def gui():
         def work():
             try:
                 run(kind, fmt, list(items), out, quality, size, log,
-                    lambda fr: root.after(0, lambda: pbar.config(value=fr * 100)), stop)
+                    lambda fr: root.after(0, lambda: pbar.config(value=fr * 100)), stop, max_mb)
             finally:
                 root.after(0, busy, False)
 
@@ -477,7 +541,7 @@ def gui():
     def on_close():
         out = v_out.get().strip('" ')
         save_settings({"kind": v_kind.get(), "fmt": v_fmt.get().split(" - ")[0], "q": v_q.get(),
-                       "size_px": v_size.get(),
+                       "size_px": v_size.get(), "max_mb": v_mb.get().strip(),
                        # domyslny OUTPUT nie zapisany - po przeniesieniu programu ma wskazywac nowe miejsce
                        "out": "" if os.path.normpath(out) == os.path.normpath(out_default) else out,
                        # zminimalizowane/zmaksymalizowane okno - zostaje poprzedni rozmiar
@@ -593,6 +657,20 @@ def selftest():
     assert "160x120" in _info(r[0]), _info(r[0])
     r = run("wideo", "MP4", [gif], out, log=quiet)  # animowany GIF -> MP4
     assert len(r) == 1 and "Video: h264" in _info(r[0])
+    # limit rozmiaru: film 20 s, limit 0.5 MB (budzet ~76 kb/s wideo), wynik <= limit + 5%
+    dlugi = os.path.join(tmp, "dlugi.mp4")
+    subprocess.run([ffmpeg_exe(), "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=20:size=320x240:rate=15",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=20", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-shortest", dlugi], check=True, creationflags=NOWIN)
+    msgs = []
+    r = run("wideo", "MP4", [dlugi], out, log=msgs.append, max_mb=0.5)
+    assert len(r) == 1 and os.path.getsize(r[0]) <= 0.5 * 1048576 * 1.05, os.path.getsize(r[0])
+    assert "Video: h264" in _info(r[0]) and "Limit" not in "".join(msgs), msgs
+    msgs = []  # za maly limit: komunikat w logu, ale plik powstaje
+    r = run("wideo", "MP4", [dlugi], out, log=msgs.append, max_mb=0.01)
+    assert len(r) == 1 and "za maly" in "".join(msgs), msgs
+    msgs = []  # limit dla formatu innego niz MP4 - pominiety
+    assert len(run("wideo", "WEBM", [mp4], out, log=msgs.append, max_mb=1)) == 1 and "tylko wideo -> MP4" in "".join(msgs)
     broken = os.path.join(tmp, "zepsuty.mkv")
     open(broken, "wb").write(b"to nie jest film")
     msgs = []
