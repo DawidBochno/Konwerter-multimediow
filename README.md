@@ -42,6 +42,12 @@ oraz animowany GIF (zamiana na MP4 zmniejsza go zwykle kilkadziesiąt razy).
 - **Jakość**: Wysoka / Dobra (domyślna) / Mała (mały plik). Dotyczy JPG, WEBP i wideo.
 - **Maksymalny rozmiar**: dłuższy bok (obrazy) albo wysokość (wideo) w pikselach.
   Mniejsze obrazy i filmy nie są powiększane.
+- **Maks. rozmiar pliku (MB)** — tylko wideo → MP4 (np. „zmieść w 25 MB na maila”).
+  Program liczy bitrate wideo z długości filmu: `MB × 8192 / czas_s − 128 kb/s` (audio) i
+  koduje **dwuprzebiegowo** (H.264, `-pass 1/2`), więc wynik zwykle mieści się w limicie
+  (ok. 5% zapasu na kontener). Gdy limit jest za mały dla długości filmu (poniżej 50 kb/s wideo),
+  log ostrzega, a plik powstaje z minimalnym bitrate i może być większy. Pole puste = bez limitu;
+  dla innych formatów limit jest pomijany (z komunikatem w logu).
 - Obrazy są **obracane zgodnie z EXIF** (zdjęcie z telefonu trzymanego pionowo
   zostaje pionowe), a **reszta metadanych, w tym lokalizacja GPS, nie jest
   kopiowana** do wyniku.
@@ -82,7 +88,7 @@ oraz animowany GIF (zamiana na MP4 zmniejsza go zwykle kilkadziesiąt razy).
    folderu wyjściowego, a oryginały zostają bez zmian. **Otwórz folder wyników**
    pokazuje je w Eksploratorze.
 
-Program zapamiętuje ostatni wybór (rodzaj, format, jakość, rozmiar, folder
+Program zapamiętuje ostatni wybór (rodzaj, format, jakość, rozmiar, limit MB, folder
 wyjściowy i rozmiar okna) w pliku `ustawienia.json` w folderze programu.
 
 ### Przykłady
@@ -152,8 +158,6 @@ w tym repozytorium.
 ## Pomysły na rozwój
 
 **Wideo**
-- **Kompresja do zadanego rozmiaru** (np. „zmieść w 25 MB na maila / komunikator”):
-  obliczenie bitrate z długości filmu i kodowanie dwuprzebiegowe.
 - **Przycinanie** (od–do), obrót i odbicie, zmiana liczby klatek, wypalanie napisów.
 - **H.265 (HEVC) i AV1** jako mniejsze pliki. Wymagają jednak odtwarzacza z tym
   kodekiem (na Windows często płatny dodatek), więc dobrze jako opcja „mniejszy plik,
